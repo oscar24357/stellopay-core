@@ -12,9 +12,7 @@
 
 use crate::{PayrollContract, PayrollContractClient};
 use soroban_sdk::{
-    testutils::Address as _,
-    token::StellarAssetClient,
-    Address, Env, Symbol,
+    testutils::Address as _, token::StellarAssetClient, Address, Env, Symbol,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -32,24 +30,18 @@ fn setup() -> (Env, Address, PayrollContractClient<'static>) {
     (env, owner, client)
 }
 
-/// Creates `n` agreements (one audit entry each) and returns the employer address.
-fn create_n_agreements(
-    env: &Env,
-    client: &PayrollContractClient,
-    n: u32,
-) -> Address {
+/// Creates `n` payroll agreements (one audit entry each).
+fn create_n_agreements(env: &Env, client: &PayrollContractClient, n: u32) {
     let employer = Address::generate(env);
     let token_admin = Address::generate(env);
     let token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(token_admin)
         .address();
     StellarAssetClient::new(env, &token).mint(&employer, &1_000_000i128);
 
     for _ in 0..n {
         client.create_payroll_agreement(&employer, &token, &3600u64);
     }
-
-    employer
 }
 
 // ── AC4: retention is readable on chain ──────────────────────────────────────
@@ -72,11 +64,9 @@ fn set_and_get_retention() {
 #[test]
 fn retention_holds_at_boundary() {
     let (env, owner, client) = setup();
-
-    // Set retention limit to 3.
     client.set_audit_retention(&owner, &3u64);
 
-    // Write 3 entries — all should still be on chain.
+    // Write exactly 3 entries — all should still be on chain.
     create_n_agreements(&env, &client, 3);
 
     assert_eq!(client.get_audit_entry_count(), 3u64);
@@ -92,7 +82,7 @@ fn write_past_limit_does_not_fail() {
     let (env, owner, client) = setup();
     client.set_audit_retention(&owner, &2u64);
 
-    // Write 4 entries — should not panic.
+    // 4 writes with limit=2 — must not panic.
     create_n_agreements(&env, &client, 4);
 
     assert_eq!(client.get_audit_entry_count(), 4u64);
@@ -105,19 +95,25 @@ fn eviction_is_oldest_first() {
     let (env, owner, client) = setup();
     client.set_audit_retention(&owner, &2u64);
 
-    // Write 4 entries: ids 1, 2, 3, 4.
-    // With limit=2 after writing id=3, id=1 is evicted.
-    // After writing id=4, id=2 is evicted.
-    // Retained entries should be ids 3 and 4.
+    // ids 1..4 written; limit=2 means ids 1 and 2 get evicted, 3 and 4 survive.
     create_n_agreements(&env, &client, 4);
 
-    // Evicted entries (ids 1 and 2) should be gone from storage.
-    assert!(client.get_audit_entry(&1u64).is_none(), "entry 1 should be evicted");
-    assert!(client.get_audit_entry(&2u64).is_none(), "entry 2 should be evicted");
-
-    // Most-recent entries should still be present.
-    assert!(client.get_audit_entry(&3u64).is_some(), "entry 3 should be retained");
-    assert!(client.get_audit_entry(&4u64).is_some(), "entry 4 should be retained");
+    assert!(
+        client.get_audit_entry(&1u64).is_none(),
+        "entry 1 should be evicted"
+    );
+    assert!(
+        client.get_audit_entry(&2u64).is_none(),
+        "entry 2 should be evicted"
+    );
+    assert!(
+        client.get_audit_entry(&3u64).is_some(),
+        "entry 3 should be retained"
+    );
+    assert!(
+        client.get_audit_entry(&4u64).is_some(),
+        "entry 4 should be retained"
+    );
 }
 
 #[test]
@@ -127,7 +123,6 @@ fn limit_one_keeps_only_latest() {
 
     create_n_agreements(&env, &client, 3);
 
-    // Only the last entry survives.
     assert!(client.get_audit_entry(&1u64).is_none());
     assert!(client.get_audit_entry(&2u64).is_none());
     assert!(client.get_audit_entry(&3u64).is_some());
@@ -143,59 +138,60 @@ fn events_emitted_for_all_entries_including_evicted() {
     let employer = Address::generate(&env);
     let token_admin = Address::generate(&env);
     let token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(token_admin)
         .address();
     StellarAssetClient::new(&env, &token).mint(&employer, &1_000_000i128);
 
-    // Write 3 entries so entry 1 gets evicted.
-    client.create_payroll_agreement(&employer, &token, &3600u64); // id=1
-    client.create_payroll_agreement(&employer, &token, &3600u64); // id=2
-    client.create_payroll_agreement(&employer, &token, &3600u64); // id=3 — triggers eviction of id=1
+    // id=1 and id=2 written; id=3 triggers eviction of id=1.
+    client.create_payroll_agreement(&employer, &token, &3600u64);
+    client.create_payroll_agreement(&employer, &token, &3600u64);
+    client.create_payroll_agreement(&employer, &token, &3600u64);
 
     let all_events = env.events().all();
 
-    // Verify an `audit_entry` event was emitted for id=1 (before eviction).
-    let entry_1_event = all_events.iter().any(|(topics, _data)| {
-        topics
-            .iter()
-            .any(|t| t == Symbol::new(&env, "audit_entry").into())
-    });
-    assert!(entry_1_event, "audit_entry events should have been emitted");
+    let audit_entry_sym = Symbol::new(&env, "audit_entry");
+    let evicted_sym = Symbol::new(&env, "audit_entry_evicted");
 
-    // Verify an `audit_entry_evicted` event was emitted for id=1.
-    let evicted_event = all_events.iter().any(|(topics, _data)| {
-        topics
-            .iter()
-            .any(|t| t == Symbol::new(&env, "audit_entry_evicted").into())
-    });
-    assert!(evicted_event, "audit_entry_evicted event should be emitted for evicted entries");
+    let has_entry_event = all_events
+        .iter()
+        .any(|(topics, _)| topics.iter().any(|t| t == audit_entry_sym.clone().into()));
+    assert!(has_entry_event, "audit_entry events should be emitted");
 
-    // id=1 must not be retrievable from storage anymore.
-    assert!(client.get_audit_entry(&1u64).is_none(), "evicted entry should be removed from storage");
+    let has_evicted_event = all_events
+        .iter()
+        .any(|(topics, _)| topics.iter().any(|t| t == evicted_sym.clone().into()));
+    assert!(
+        has_evicted_event,
+        "audit_entry_evicted event should be emitted for evicted entries"
+    );
+
+    // id=1 must be gone from persistent storage.
+    assert!(
+        client.get_audit_entry(&1u64).is_none(),
+        "evicted entry should be removed from storage"
+    );
 }
 
 // ── unlimited retention (limit=0) leaves all entries on chain ────────────────
 
 #[test]
 fn zero_limit_means_unlimited() {
-    let (_env, _owner, client) = setup();
-    // Default is 0 (unlimited); do not set any limit.
-    let (env, _owner2, client2) = setup();
+    let (env, _owner, client) = setup();
 
     let employer = Address::generate(&env);
     let token_admin = Address::generate(&env);
     let token = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(token_admin)
         .address();
     StellarAssetClient::new(&env, &token).mint(&employer, &1_000_000i128);
 
     for _ in 0..10 {
-        client2.create_payroll_agreement(&employer, &token, &3600u64);
+        client.create_payroll_agreement(&employer, &token, &3600u64);
     }
 
-    // All 10 entries should remain.
+    // All 10 entries should remain with the default unlimited retention.
     for i in 1u64..=10 {
-        assert!(client2.get_audit_entry(&i).is_some(), "entry {} should be retained with unlimited retention", i);
+        assert!(client.get_audit_entry(&i).is_some());
     }
 }
 
